@@ -1026,32 +1026,36 @@ public:
         result_cb(number, image_data, result_cb_data);
     }
 
-    sd_result_step_cb_t result_step_cb = nullptr;
-    int result_step_cb_interval        = 1;
-    void* result_step_cb_data          = nullptr;
+    sd_result_step_cb_t result_step_cb   = nullptr;
+    int result_step_cb_preview_interval  = -1;
+    void* result_step_cb_data            = nullptr;
 
     void send_result_step_callback(ggml_context* task_work_ctx, ggml_tensor* x, size_t number, size_t step) {
-        if (result_step_cb == nullptr || step % result_step_cb_interval != 0) {
+        if (result_step_cb == nullptr) {
             return;
         }
 
-        struct ggml_init_params params {};
-        params.mem_size   = ggml_get_mem_size(task_work_ctx);
-        params.mem_buffer = nullptr;
-        params.no_alloc   = false;
+        if (result_step_cb_preview_interval != -1 && step % result_step_cb_preview_interval == 0) {
+            struct ggml_init_params params {};
+            params.mem_size   = ggml_get_mem_size(task_work_ctx);
+            params.mem_buffer = nullptr;
+            params.no_alloc   = false;
 
-        struct ggml_context* work_ctx = ggml_init(params);
-        if (!work_ctx) {
-            return;
+            struct ggml_context* work_ctx = ggml_init(params);
+            if (!work_ctx) {
+                return;
+            }
+
+            struct ggml_tensor* result = ggml_dup_tensor(work_ctx, x);
+            copy_ggml_tensor(result, x);
+
+            struct ggml_tensor* img = decode_first_stage(work_ctx, result);
+            result_step_cb(number, step, sd_tensor_to_image(img), result_step_cb_data);
+
+            ggml_free(work_ctx);
+        } else {
+            result_step_cb(number, step, nullptr, result_step_cb_data);
         }
-
-        struct ggml_tensor* result = ggml_dup_tensor(work_ctx, x);
-        copy_ggml_tensor(result, x);
-
-        struct ggml_tensor* img = decode_first_stage(work_ctx, result);
-        result_step_cb(number, step, sd_tensor_to_image(img), result_step_cb_data);
-
-        ggml_free(work_ctx);
     }
 };
 
@@ -1140,13 +1144,13 @@ void free_sd_ctx(sd_ctx_t* sd_ctx) {
 }
 
 void sd_ctx_set_result_callback(sd_ctx_t* sd_ctx, sd_result_cb_t cb, void* data) {
-    sd_ctx->sd->result_cb      = cb;
+    sd_ctx->sd->result_cb = cb;
     sd_ctx->sd->result_cb_data = data;
 }
 
-void sd_ctx_set_result_step_callback(sd_ctx_t* sd_ctx, sd_result_step_cb_t cb, int cb_interval, void* data) {
-    sd_ctx->sd->result_step_cb      = cb;
-    sd_ctx->sd->result_step_cb_interval = cb_interval;
+void sd_ctx_set_result_step_callback(sd_ctx_t* sd_ctx, sd_result_step_cb_t cb, int cb_preview_interval, void* data) {
+    sd_ctx->sd->result_step_cb = cb;
+    sd_ctx->sd->result_step_cb_preview_interval = cb_preview_interval;
     sd_ctx->sd->result_step_cb_data = data;
 }
 
