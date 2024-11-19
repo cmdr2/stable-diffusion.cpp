@@ -1143,12 +1143,12 @@ void free_sd_ctx(sd_ctx_t* sd_ctx) {
     free(sd_ctx);
 }
 
-void sd_ctx_set_result_callback(sd_ctx_t* sd_ctx, sd_result_cb_t cb, void* data) {
+void sd_set_result_callback(sd_ctx_t* sd_ctx, sd_result_cb_t cb, void* data) {
     sd_ctx->sd->result_cb = cb;
     sd_ctx->sd->result_cb_data = data;
 }
 
-void sd_ctx_set_result_step_callback(sd_ctx_t* sd_ctx, sd_result_step_cb_t cb, int cb_preview_interval, void* data) {
+void sd_set_result_step_callback(sd_ctx_t* sd_ctx, sd_result_step_cb_t cb, int cb_preview_interval, void* data) {
     sd_ctx->sd->result_step_cb = cb;
     sd_ctx->sd->result_step_cb_preview_interval = cb_preview_interval;
     sd_ctx->sd->result_step_cb_data = data;
