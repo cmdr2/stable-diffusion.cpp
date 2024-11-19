@@ -896,7 +896,7 @@ public:
                 // LOG_INFO("step %d sampling completed taking %.2fs", step, (t1 - t0) * 1.0f / 1000000);
             }
 
-            send_result_step_callback(denoised, batch_num, step);
+            send_result_step_callback(work_ctx, denoised, batch_num, step);
 
             return denoised;
         };
@@ -1029,13 +1029,13 @@ public:
     sd_result_step_cb_t result_step_cb = nullptr;
     void* result_step_cb_data          = nullptr;
 
-    void send_result_step_callback(ggml_tensor* x, size_t number, size_t step) {
+    void send_result_step_callback(ggml_context* task_work_ctx, ggml_tensor* x, size_t number, size_t step) {
         if (result_step_cb == nullptr) {
             return;
         }
 
         struct ggml_init_params params {};
-        params.mem_size   = static_cast<size_t>(10 * 1024) * 1024;
+        params.mem_size   = ggml_get_mem_size(task_work_ctx);
         params.mem_buffer = nullptr;
         params.no_alloc   = false;
 
