@@ -230,9 +230,6 @@ int32_t get_num_physical_cores() {
     return n_threads > 0 ? (n_threads <= 4 ? n_threads : n_threads / 2) : 4;
 }
 
-static sd_progress_cb_t sd_progress_cb = NULL;
-void* sd_progress_cb_data              = NULL;
-
 std::u32string utf8_to_utf32(const std::string& utf8_str) {
     std::wstring_convert<std::codecvt_utf8<char32_t>, char32_t> converter;
     return converter.from_bytes(utf8_str);
@@ -310,10 +307,6 @@ sd_image_t* preprocess_id_image(sd_image_t* img) {
 }
 
 void pretty_progress(int step, int steps, float time) {
-    if (sd_progress_cb) {
-        sd_progress_cb(step, steps, time, sd_progress_cb_data);
-        return;
-    }
     if (step == 0) {
         return;
     }
@@ -384,10 +377,6 @@ void log_printf(sd_log_level_t level, const char* file, int line, const char* fo
 void sd_set_log_callback(sd_log_cb_t cb, void* data) {
     sd_log_cb      = cb;
     sd_log_cb_data = data;
-}
-void sd_set_progress_callback(sd_progress_cb_t cb, void* data) {
-    sd_progress_cb      = cb;
-    sd_progress_cb_data = data;
 }
 const char* sd_get_system_info() {
     static char buffer[1024];
