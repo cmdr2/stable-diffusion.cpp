@@ -1027,10 +1027,11 @@ public:
     }
 
     sd_result_step_cb_t result_step_cb = nullptr;
+    int result_step_cb_interval        = 1;
     void* result_step_cb_data          = nullptr;
 
     void send_result_step_callback(ggml_context* task_work_ctx, ggml_tensor* x, size_t number, size_t step) {
-        if (result_step_cb == nullptr) {
+        if (result_step_cb == nullptr || step % result_step_cb_interval != 0) {
             return;
         }
 
@@ -1143,8 +1144,9 @@ void sd_ctx_set_result_callback(sd_ctx_t* sd_ctx, sd_result_cb_t cb, void* data)
     sd_ctx->sd->result_cb_data = data;
 }
 
-void sd_ctx_set_result_step_callback(sd_ctx_t* sd_ctx, sd_result_step_cb_t cb, void* data) {
+void sd_ctx_set_result_step_callback(sd_ctx_t* sd_ctx, sd_result_step_cb_t cb, int cb_interval, void* data) {
     sd_ctx->sd->result_step_cb      = cb;
+    sd_ctx->sd->result_step_cb_interval = cb_interval;
     sd_ctx->sd->result_step_cb_data = data;
 }
 
