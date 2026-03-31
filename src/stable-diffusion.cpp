@@ -765,10 +765,20 @@ public:
             // so we turn them on automatically unless the user explicitly
             // disabled them.  The ggml runtime will still fall back to regular
             // attention if the backend does not support the operation.
-            bool use_diffusion_flash_attn = sd_ctx_params->flash_attn ||
-                                            sd_ctx_params->diffusion_flash_attn ||
-                                            !ggml_backend_is_cpu(backend);
-            if (use_diffusion_flash_attn) {
+            if (!ggml_backend_is_cpu(backend)) {
+                LOG_INFO("Auto-enabling flash attention for GPU backend");
+                diffusion_model->set_flash_attention_enabled(true);
+                if (high_noise_diffusion_model) {
+                    high_noise_diffusion_model->set_flash_attention_enabled(true);
+                }
+                // Also enable for VAE/CLIP when they share the GPU backend.
+                if (!sd_ctx_params->keep_vae_on_cpu && first_stage_model) {
+                    first_stage_model->set_flash_attention_enabled(true);
+                }
+                if (!sd_ctx_params->keep_clip_on_cpu) {
+                    cond_stage_model->set_flash_attention_enabled(true);
+                }
+            } else if (sd_ctx_params->flash_attn || sd_ctx_params->diffusion_flash_attn) {
                 LOG_INFO("Using flash attention in the diffusion model");
                 diffusion_model->set_flash_attention_enabled(true);
                 if (high_noise_diffusion_model) {
@@ -1803,6 +1813,10 @@ public:
                 auto parts           = sd::ops::chunk(batch_output, 2, out_batch_dim);
                 cond_out             = parts[0].squeeze(out_batch_dim);
                 uncond_out           = parts[1].squeeze(out_batch_dim);
+
+                // Populate the step cache so future steps can use the results.
+                step_cache.after_condition(&cond, noised_input, cond_out);
+                step_cache.after_condition(&uncond, noised_input, uncond_out);
             } else {
                 // Non-batched path: separate model calls for each condition.
                 if (start_merge_step == -1 || step <= start_merge_step) {
