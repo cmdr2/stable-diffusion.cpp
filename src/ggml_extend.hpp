@@ -1366,7 +1366,9 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
         if (kv_scale != 1.0f) {
             k_in = ggml_ext_scale(ctx, k_in, kv_scale);
         }
-        k_in = ggml_cast(ctx, k_in, GGML_TYPE_F16);
+        if (k_in->type != GGML_TYPE_F16) {
+            k_in = ggml_cast(ctx, k_in, GGML_TYPE_F16);
+        }
 
         v_in = ggml_ext_cont(ctx, ggml_permute(ctx, v_in, 0, 2, 1, 3));
         v_in = ggml_reshape_3d(ctx, v_in, d_head, L_k, n_kv_head * N);
@@ -1376,7 +1378,9 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
         if (kv_scale != 1.0f) {
             v_in = ggml_ext_scale(ctx, v_in, kv_scale);
         }
-        v_in = ggml_cast(ctx, v_in, GGML_TYPE_F16);
+        if (v_in->type != GGML_TYPE_F16) {
+            v_in = ggml_cast(ctx, v_in, GGML_TYPE_F16);
+        }
 
         if (mask_in != nullptr) {
             mask_in = ggml_transpose(ctx, mask_in);
@@ -1400,7 +1404,9 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
                 mask_in = ggml_pad(ctx, mask_in, 0, mask_pad, 0, 0);
             }
 #endif
-            mask_in = ggml_cast(ctx, mask_in, GGML_TYPE_F16);
+            if (mask_in->type != GGML_TYPE_F16) {
+                mask_in = ggml_cast(ctx, mask_in, GGML_TYPE_F16);
+            }
         }
 
         auto out = ggml_flash_attn_ext(ctx, q_in, k_in, v_in, mask_in, scale / kv_scale, 0, 0);
@@ -1625,7 +1631,9 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_timestep_embedding(
     int dim,
     int max_period    = 10000,
     float time_factor = 1.0f) {
-    timesteps = ggml_ext_scale(ctx, timesteps, time_factor);
+    if (time_factor != 1.0f) {
+        timesteps = ggml_ext_scale(ctx, timesteps, time_factor);
+    }
     return ggml_timestep_embedding(ctx, timesteps, dim, max_period);
 }
 
@@ -1702,6 +1710,16 @@ protected:
 
     ggml_context* compute_ctx    = nullptr;
     ggml_gallocr* compute_allocr = nullptr;
+
+    // Pre-allocated buffer for compute_ctx. By reusing the same buffer across
+    // reset_compute_ctx() calls, ggml tensors and graph nodes are allocated at
+    // deterministic addresses. This is critical for CUDA graph support: the CUDA
+    // backend identifies graphs by node[0] pointer and checks that tensor data
+    // pointers are stable between calls. Without buffer reuse, every call
+    // rebuilds tensors at new addresses, causing CUDA graph warmup to reset
+    // and graphs to never activate.
+    void* compute_ctx_buffer        = nullptr;
+    size_t compute_ctx_buffer_size  = 0;
 
     std::shared_ptr<WeightAdapter> weight_adapter = nullptr;
 
@@ -1789,9 +1807,21 @@ protected:
     }
 
     void alloc_compute_ctx() {
+        const size_t required_size = static_cast<size_t>(ggml_tensor_overhead() * MAX_GRAPH_SIZE + ggml_graph_overhead());
+
+        // Allocate the buffer once and reuse it across calls. This ensures
+        // that ggml tensors and graph nodes land at the same memory addresses
+        // every time the graph is rebuilt, which is required for CUDA graph
+        // capture and replay.
+        if (compute_ctx_buffer == nullptr) {
+            compute_ctx_buffer_size = required_size;
+            compute_ctx_buffer      = malloc(compute_ctx_buffer_size);
+            GGML_ASSERT(compute_ctx_buffer != nullptr);
+        }
+
         ggml_init_params params;
-        params.mem_size   = static_cast<size_t>(ggml_tensor_overhead() * MAX_GRAPH_SIZE + ggml_graph_overhead());
-        params.mem_buffer = nullptr;
+        params.mem_size   = compute_ctx_buffer_size;
+        params.mem_buffer = compute_ctx_buffer;
         params.no_alloc   = true;
 
         compute_ctx = ggml_init(params);
@@ -1802,6 +1832,15 @@ protected:
         if (compute_ctx != nullptr) {
             ggml_free(compute_ctx);
             compute_ctx = nullptr;
+        }
+    }
+
+    void free_compute_ctx_buffer() {
+        free_compute_ctx();
+        if (compute_ctx_buffer != nullptr) {
+            free(compute_ctx_buffer);
+            compute_ctx_buffer      = nullptr;
+            compute_ctx_buffer_size = 0;
         }
     }
 
@@ -2009,7 +2048,7 @@ public:
         free_params_buffer();
         free_compute_buffer();
         free_params_ctx();
-        free_compute_ctx();
+        free_compute_ctx_buffer();
         if (params_backend != runtime_backend) {
             ggml_backend_free(params_backend);
         }

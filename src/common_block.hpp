@@ -157,7 +157,7 @@ public:
                 }
             }
 
-            h = ggml_add(ctx->ggml_ctx, h, emb_out);  // [N, out_channels, h, w] if dims == 2 else [N, out_channels, t, h, w]
+            h = ggml_add_inplace(ctx->ggml_ctx, h, emb_out);  // [N, out_channels, h, w] if dims == 2 else [N, out_channels, t, h, w]
         }
 
         // out_layers
@@ -377,21 +377,21 @@ public:
             x           = norm_in->forward(ctx, x);
             x           = ff_in->forward(ctx, x);
             // self.is_res is always True
-            x = ggml_add(ctx->ggml_ctx, x, x_skip);
+            x = ggml_add_inplace(ctx->ggml_ctx, x, x_skip);
         }
 
         auto r = x;
         x      = norm1->forward(ctx, x);
         x      = attn1->forward(ctx, x, x);  // self-attention
-        x      = ggml_add(ctx->ggml_ctx, x, r);
+        x      = ggml_add_inplace(ctx->ggml_ctx, x, r);
         r      = x;
         x      = norm2->forward(ctx, x);
         x      = attn2->forward(ctx, x, context);  // cross-attention
-        x      = ggml_add(ctx->ggml_ctx, x, r);
+        x      = ggml_add_inplace(ctx->ggml_ctx, x, r);
         r      = x;
         x      = norm3->forward(ctx, x);
         x      = ff->forward(ctx, x);
-        x      = ggml_add(ctx->ggml_ctx, x, r);
+        x      = ggml_add_inplace(ctx->ggml_ctx, x, r);
 
         return x;
     }
@@ -503,7 +503,7 @@ public:
             x = proj_out->forward(ctx, x);  // [N, in_channels, h, w]
         }
 
-        x = ggml_add(ctx->ggml_ctx, x, x_in);
+        x = ggml_add_inplace(ctx->ggml_ctx, x, x_in);
         return x;
     }
 };

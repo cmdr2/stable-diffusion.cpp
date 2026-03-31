@@ -158,7 +158,7 @@ public:
         // proj_out
         x = proj_out->forward(ctx, x);  // [N, in_channels, h, w]
 
-        x = ggml_add(ctx->ggml_ctx, x, x_in);
+        x = ggml_add_inplace(ctx->ggml_ctx, x, x_in);
         return x;
     }
 };
