@@ -458,7 +458,7 @@ public:
 
     // Helper: apply a 1x1 Conv2d as a linear layer (avoiding im2col overhead).
     // Assumes w is [1, 1, IC, OC] and x is [..., IC] (IC in ne[0]).
-    // Returns [..., OC].
+    // Returns [..., OC] in F32.
     ggml_tensor* apply_conv1x1_as_linear(GGMLRunnerContext* ctx,
                                          ggml_tensor* x,
                                          ggml_tensor* w,
