@@ -2003,6 +2003,15 @@ public:
         } else {
             params_backend = runtime_backend;
         }
+#ifdef SD_USE_VULKAN
+        if (ggml_backend_is_vk(runtime_backend)) {
+            // Vulkan benefits from direct conv2d (single fused shader) instead of
+            // the im2col+mul_mat decomposition (5 separate dispatches).
+            conv2d_direct_enabled = true;
+            // Vulkan has an optimized flash attention shader.
+            flash_attn_enabled = true;
+        }
+#endif
     }
 
     virtual ~GGMLRunner() {
