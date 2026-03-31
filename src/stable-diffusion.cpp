@@ -760,7 +760,15 @@ public:
                 }
             }
 
-            if (sd_ctx_params->flash_attn || sd_ctx_params->diffusion_flash_attn) {
+            // Enable flash attention for the diffusion model.  When running on a
+            // GPU backend the flash-attention kernels are almost always faster,
+            // so we turn them on automatically unless the user explicitly
+            // disabled them.  The ggml runtime will still fall back to regular
+            // attention if the backend does not support the operation.
+            bool use_diffusion_flash_attn = sd_ctx_params->flash_attn ||
+                                            sd_ctx_params->diffusion_flash_attn ||
+                                            !ggml_backend_is_cpu(backend);
+            if (use_diffusion_flash_attn) {
                 LOG_INFO("Using flash attention in the diffusion model");
                 diffusion_model->set_flash_attention_enabled(true);
                 if (high_noise_diffusion_model) {
@@ -1711,31 +1719,118 @@ public:
                 return output_opt;
             };
 
-            if (start_merge_step == -1 || step <= start_merge_step) {
-                cond_out = run_condition(cond);
-                if (cond_out.empty()) {
-                    return {};
-                }
-            } else {
-                GGML_ASSERT(!id_cond.empty());
-                cond_out = run_condition(id_cond,
-                                         cond.c_concat.empty() ? nullptr : &cond.c_concat);
-                if (cond_out.empty()) {
-                    return {};
-                }
-            }
+            // Determine if we can batch CFG into a single model forward pass.
+            // This is the common case for standard text-to-image with guidance.
+            // Batching halves the number of UNet evaluations per denoising step.
+            bool can_batch_cfg = !uncond.empty() &&
+                                 img_cond.empty() &&
+                                 !has_skiplayer &&
+                                 control_image.empty() &&
+                                 start_merge_step == -1 &&
+                                 id_cond.empty() &&
+                                 cond.c_concat.empty() &&
+                                 uncond.c_concat.empty() &&
+                                 !step_cache.is_step_skipped();
 
-            if (!uncond.empty()) {
-                if (!step_cache.is_step_skipped()) {
-                    compute_sample_controls(control_image,
-                                            noised_input,
-                                            timesteps_tensor,
-                                            uncond,
-                                            &controls);
+            if (can_batch_cfg) {
+                // Batched CFG: merge conditional and unconditional into a single forward pass.
+                // Duplicate noised_input along a new batch dimension.
+                size_t x_batch_dim = static_cast<size_t>(noised_input.dim());
+                auto batch_x       = sd::ops::concat(
+                    noised_input.unsqueeze(x_batch_dim),
+                    noised_input.unsqueeze(x_batch_dim),
+                    x_batch_dim);
+
+                // Duplicate timesteps.
+                std::vector<float> batch_ts_vec;
+                batch_ts_vec.reserve(timesteps_vec.size() * 2);
+                batch_ts_vec.insert(batch_ts_vec.end(), timesteps_vec.begin(), timesteps_vec.end());
+                batch_ts_vec.insert(batch_ts_vec.end(), timesteps_vec.begin(), timesteps_vec.end());
+                sd::Tensor<float> batch_ts({static_cast<int64_t>(batch_ts_vec.size())}, batch_ts_vec);
+
+                // Concatenate context (cond + uncond) along batch dimension.
+                sd::Tensor<float> batch_context;
+                {
+                    const auto& ctx_a = cond.c_crossattn;
+                    const auto& ctx_b = uncond.c_crossattn;
+                    if (!ctx_a.empty() && !ctx_b.empty()) {
+                        size_t ctx_batch_dim = static_cast<size_t>(ctx_a.dim());
+                        batch_context        = sd::ops::concat(
+                            ctx_a.unsqueeze(ctx_batch_dim),
+                            ctx_b.unsqueeze(ctx_batch_dim),
+                            ctx_batch_dim);
+                    }
                 }
-                uncond_out = run_condition(uncond);
-                if (uncond_out.empty()) {
+
+                // Concatenate y (vector conditioning) if present (e.g. SDXL).
+                sd::Tensor<float> batch_y;
+                {
+                    const auto& y_a = cond.c_vector;
+                    const auto& y_b = uncond.c_vector;
+                    if (!y_a.empty() && !y_b.empty()) {
+                        size_t y_batch_dim = static_cast<size_t>(y_a.dim());
+                        batch_y            = sd::ops::concat(
+                            y_a.unsqueeze(y_batch_dim),
+                            y_b.unsqueeze(y_batch_dim),
+                            y_batch_dim);
+                    }
+                }
+
+                // Set up batched diffusion params.
+                DiffusionParams batch_params;
+                batch_params.x                  = &batch_x;
+                batch_params.timesteps          = &batch_ts;
+                batch_params.context            = batch_context.empty() ? nullptr : &batch_context;
+                batch_params.y                  = batch_y.empty() ? nullptr : &batch_y;
+                batch_params.c_concat           = nullptr;
+                batch_params.guidance           = &guidance_tensor;
+                batch_params.ref_latents        = &ref_latents;
+                batch_params.increase_ref_index = increase_ref_index;
+                batch_params.controls           = &controls;
+                batch_params.control_strength   = control_strength;
+                batch_params.vace_context       = vace_context.empty() ? nullptr : &vace_context;
+                batch_params.vace_strength      = vace_strength;
+                batch_params.skip_layers        = nullptr;
+
+                auto batch_output = work_diffusion_model->compute(n_threads, batch_params);
+                if (batch_output.empty()) {
+                    LOG_ERROR("diffusion model compute failed (batched CFG)");
                     return {};
+                }
+
+                // Split output along batch dimension.
+                size_t out_batch_dim = static_cast<size_t>(batch_output.dim()) - 1;
+                auto parts           = sd::ops::chunk(batch_output, 2, out_batch_dim);
+                cond_out             = parts[0].squeeze(out_batch_dim);
+                uncond_out           = parts[1].squeeze(out_batch_dim);
+            } else {
+                // Non-batched path: separate model calls for each condition.
+                if (start_merge_step == -1 || step <= start_merge_step) {
+                    cond_out = run_condition(cond);
+                    if (cond_out.empty()) {
+                        return {};
+                    }
+                } else {
+                    GGML_ASSERT(!id_cond.empty());
+                    cond_out = run_condition(id_cond,
+                                             cond.c_concat.empty() ? nullptr : &cond.c_concat);
+                    if (cond_out.empty()) {
+                        return {};
+                    }
+                }
+
+                if (!uncond.empty()) {
+                    if (!step_cache.is_step_skipped()) {
+                        compute_sample_controls(control_image,
+                                                noised_input,
+                                                timesteps_tensor,
+                                                uncond,
+                                                &controls);
+                    }
+                    uncond_out = run_condition(uncond);
+                    if (uncond_out.empty()) {
+                        return {};
+                    }
                 }
             }
             if (!img_cond.empty()) {
