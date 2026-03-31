@@ -1785,6 +1785,6 @@ bool convert(const char* input_path,
     if (convert_name) {
         model_loader.convert_tensors_name();
     }
-    bool success = model_loader.save_to_gguf_file(output_path, (ggml_type)output_type, tensor_type_rules);
+    bool success = model_loader.save_to_gguf_file(output_path, (ggml_type)output_type, SAFE_STR(tensor_type_rules));
     return success;
 }

@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <array>
 #include <cerrno>
 #include <cstdint>
 #include <cstdlib>
@@ -29,6 +30,29 @@ struct TensorSpec {
     std::vector<int64_t> shape;
     uint64_t element_count = 0;
     uint64_t data_offset   = 0;
+};
+
+struct TempFile {
+    std::string path;
+
+    explicit TempFile(const char* name_template) {
+        std::vector<char> path_buf(std::strlen(name_template) + 1);
+        std::memcpy(path_buf.data(), name_template, path_buf.size());
+
+        const int fd = ::mkstemp(path_buf.data());
+        if (fd < 0) {
+            return;
+        }
+
+        ::close(fd);
+        path = path_buf.data();
+    }
+
+    ~TempFile() {
+        if (!path.empty()) {
+            ::unlink(path.c_str());
+        }
+    }
 };
 
 int fail(const char* message) {
@@ -178,6 +202,53 @@ bool write_dummy_weights_file(int fd, const std::vector<TensorSpec>& specs) {
     return ::lseek(fd, 0, SEEK_SET) >= 0;
 }
 
+bool run_sd_1_5_smoke_test(const std::string& model_path) {
+    sd_ctx_params_t ctx_params;
+    sd_ctx_params_init(&ctx_params);
+    ctx_params.model_path            = model_path.c_str();
+    ctx_params.n_threads             = 1;
+    ctx_params.wtype                 = SD_TYPE_COUNT;
+    ctx_params.rng_type              = CPU_RNG;
+    ctx_params.sampler_rng_type      = CPU_RNG;
+    ctx_params.enable_mmap           = false;
+    ctx_params.offload_params_to_cpu = false;
+
+    sd_ctx_t* ctx = new_sd_ctx(&ctx_params);
+    if (ctx == nullptr) {
+        return false;
+    }
+
+    sd_img_gen_params_t gen_params;
+    sd_img_gen_params_init(&gen_params);
+    gen_params.prompt                       = "test";
+    gen_params.width                        = 64;
+    gen_params.height                       = 64;
+    gen_params.seed                         = 1234;
+    gen_params.sample_params.sample_steps   = 1;
+    gen_params.sample_params.sample_method  = EULER_A_SAMPLE_METHOD;
+    gen_params.sample_params.scheduler      = DISCRETE_SCHEDULER;
+    gen_params.sample_params.guidance.txt_cfg = 1.0f;
+    gen_params.sample_params.guidance.img_cfg = 1.0f;
+
+    sd_image_t* images = generate_image(ctx, &gen_params);
+
+    free_sd_ctx(ctx);
+
+    if (images == nullptr) {
+        return false;
+    }
+
+    const bool valid_shape = images[0].data != nullptr &&
+                             images[0].width == 64 &&
+                             images[0].height == 64 &&
+                             images[0].channel == 3;
+
+    free(images[0].data);
+    free(images);
+
+    return valid_shape;
+}
+
 }  // namespace
 
 int main() {
@@ -198,54 +269,33 @@ int main() {
 
     const std::string model_path = "/proc/self/fd/" + std::to_string(fd);
 
-    sd_ctx_params_t ctx_params;
-    sd_ctx_params_init(&ctx_params);
-    ctx_params.model_path        = model_path.c_str();
-    ctx_params.n_threads         = 1;
-    ctx_params.wtype             = SD_TYPE_F16;
-    ctx_params.rng_type          = CPU_RNG;
-    ctx_params.sampler_rng_type  = CPU_RNG;
-    ctx_params.enable_mmap       = false;
-    ctx_params.offload_params_to_cpu = false;
+    constexpr std::array<sd_type_t, 3> kOutputTypes = {
+        SD_TYPE_F16,
+        SD_TYPE_Q3_K,
+        SD_TYPE_Q5_K,
+    };
 
-    sd_ctx_t* ctx = new_sd_ctx(&ctx_params);
-    if (ctx == nullptr) {
-        ::close(fd);
-        return fail("failed to initialize SD context from dummy model");
+    for (sd_type_t output_type : kOutputTypes) {
+        TempFile gguf_file("/tmp/test-sd-1-5-XXXXXX");
+        if (gguf_file.path.empty()) {
+            ::close(fd);
+            return fail("failed to create temporary GGUF file");
+        }
+
+        if (!convert(model_path.c_str(), nullptr, gguf_file.path.c_str(), output_type, nullptr, false)) {
+            ::close(fd);
+            std::fprintf(stderr, "failed to convert dummy model to %s\n", sd_type_name(output_type));
+            return 1;
+        }
+
+        if (!run_sd_1_5_smoke_test(gguf_file.path)) {
+            ::close(fd);
+            std::fprintf(stderr, "image generation failed for %s model\n", sd_type_name(output_type));
+            return 1;
+        }
     }
 
-    sd_img_gen_params_t gen_params;
-    sd_img_gen_params_init(&gen_params);
-    gen_params.prompt                    = "test";
-    gen_params.width                     = 64;
-    gen_params.height                    = 64;
-    gen_params.seed                      = 1234;
-    gen_params.sample_params.sample_steps = 1;
-    gen_params.sample_params.sample_method = EULER_A_SAMPLE_METHOD;
-    gen_params.sample_params.scheduler     = DISCRETE_SCHEDULER;
-    gen_params.sample_params.guidance.txt_cfg = 1.0f;
-    gen_params.sample_params.guidance.img_cfg = 1.0f;
-
-    sd_image_t* images = generate_image(ctx, &gen_params);
-
-    free_sd_ctx(ctx);
     ::close(fd);
-
-    if (images == nullptr) {
-        return fail("image generation failed");
-    }
-
-    const bool valid_shape = images[0].data != nullptr &&
-                             images[0].width == 64 &&
-                             images[0].height == 64 &&
-                             images[0].channel == 3;
-
-    free(images[0].data);
-    free(images);
-
-    if (!valid_shape) {
-        return fail("unexpected output image shape");
-    }
 
     return 0;
 }
