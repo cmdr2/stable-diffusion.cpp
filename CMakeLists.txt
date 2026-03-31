@@ -27,7 +27,7 @@ endif()
 #
 
 # general
-#option(SD_BUILD_TESTS                "sd: build tests"    ${SD_STANDALONE})
+option(SD_BUILD_TESTS                "sd: build tests"    ${SD_STANDALONE})
 option(SD_BUILD_EXAMPLES             "sd: build examples" ${SD_STANDALONE})
 option(SD_CUDA                       "sd: cuda backend" OFF)
 option(SD_HIPBLAS                    "sd: rocm backend" OFF)
@@ -184,6 +184,11 @@ target_compile_features(${SD_LIB} PUBLIC c_std_11 cxx_std_17)
 
 if (SD_BUILD_EXAMPLES)
     add_subdirectory(examples)
+endif()
+
+if (SD_BUILD_TESTS)
+    add_executable(sd-test-unet-perf tests/perf/test_unet.cpp)
+    target_link_libraries(sd-test-unet-perf PRIVATE stable-diffusion ${CMAKE_THREAD_LIBS_INIT})
 endif()
 
 set(SD_PUBLIC_HEADERS include/stable-diffusion.h)
