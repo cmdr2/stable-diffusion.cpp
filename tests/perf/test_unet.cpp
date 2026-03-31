@@ -180,9 +180,7 @@ public:
             return build_graph(x, timesteps, context);
         };
 
-        auto result = GGMLRunner::compute<float>(get_graph, n_threads, false, true);
-        GGML_ASSERT(result.has_value() == false);
-
+        GGMLRunner::compute<float>(get_graph, n_threads, false, true);
         const ggml_tensor* output = ggml_get_tensor(compute_ctx, final_result_name.c_str());
         GGML_ASSERT(output != nullptr);
         return output;
@@ -203,87 +201,87 @@ int main() {
     ggml_backend_t backend = ggml_backend_cpu_init();
     GGML_ASSERT(backend != nullptr);
 
+    int return_code = EXIT_SUCCESS;
     {
         FP16UNetPerfRunner runner(backend, tensor_storage_map);
         runner.set_flash_attention_enabled(true);
 
         if (!runner.alloc_params_buffer()) {
             std::fprintf(stderr, "Failed to allocate UNet parameter buffer.\n");
-            ggml_backend_free(backend);
-            return EXIT_FAILURE;
+            return_code = EXIT_FAILURE;
+        } else {
+            std::map<std::string, ggml_tensor*> param_tensors;
+            runner.get_param_tensors(param_tensors);
+
+            std::mt19937 weights_rng(kRandomSeed);
+            for (const auto& entry : param_tensors) {
+                fill_backend_tensor_random(entry.second, weights_rng, -kWeightInitScale, kWeightInitScale);
+            }
+
+            sd::Tensor<ggml_fp16_t> latent({latent_size, latent_size, kLatentChannels, kBatchSize});
+            sd::Tensor<ggml_fp16_t> context({kContextDim, kContextTokens, kBatchSize});
+            sd::Tensor<float> timesteps({kBatchSize});
+
+            std::mt19937 input_rng(kRandomSeed + 1U);
+            latent.values()  = make_random_values<ggml_fp16_t>(latent.numel(), input_rng, -kInputInitScale, kInputInitScale);
+            context.values() = make_random_values<ggml_fp16_t>(context.numel(), input_rng, -kInputInitScale, kInputInitScale);
+            timesteps.values().assign(static_cast<size_t>(kBatchSize), 999.0f);
+
+            std::printf("Stable Diffusion 1.5 UNet perf test\n");
+            std::printf("image_size=%dx%d latent_shape=[%d,%d,%d,%d] context_shape=[%d,%d,%d] threads=%d params=%zu params_buffer_mb=%.2f\n",
+                        kImageSize,
+                        kImageSize,
+                        latent_size,
+                        latent_size,
+                        kLatentChannels,
+                        kBatchSize,
+                        kContextDim,
+                        kContextTokens,
+                        kBatchSize,
+                        n_threads,
+                        param_tensors.size(),
+                        runner.get_params_buffer_size() / (1024.0 * 1024.0));
+
+            for (int step = 0; step < kWarmupSteps; ++step) {
+                const int64_t t0 = ggml_time_us();
+                const ggml_tensor* output = runner.run(n_threads, latent, timesteps, context);
+                const int64_t t1 = ggml_time_us();
+                std::printf("warmup_step_%d duration_ms=%.3f output_type=%s output_shape=[%lld,%lld,%lld,%lld] checksum=%.6f\n",
+                            step + 1,
+                            (t1 - t0) / 1000.0,
+                            ggml_type_name(output->type),
+                            static_cast<long long>(output->ne[0]),
+                            static_cast<long long>(output->ne[1]),
+                            static_cast<long long>(output->ne[2]),
+                            static_cast<long long>(output->ne[3]),
+                            checksum_tensor(output));
+            }
+
+            std::vector<double> measured_ms;
+            measured_ms.reserve(kMeasuredSteps);
+            for (int step = 0; step < kMeasuredSteps; ++step) {
+                const int64_t t0 = ggml_time_us();
+                const ggml_tensor* output = runner.run(n_threads, latent, timesteps, context);
+                const int64_t t1 = ggml_time_us();
+                const double elapsed_ms = (t1 - t0) / 1000.0;
+                measured_ms.push_back(elapsed_ms);
+
+                std::printf("measured_step_%d duration_ms=%.3f output_type=%s output_shape=[%lld,%lld,%lld,%lld] checksum=%.6f\n",
+                            step + 1,
+                            elapsed_ms,
+                            ggml_type_name(output->type),
+                            static_cast<long long>(output->ne[0]),
+                            static_cast<long long>(output->ne[1]),
+                            static_cast<long long>(output->ne[2]),
+                            static_cast<long long>(output->ne[3]),
+                            checksum_tensor(output));
+            }
+
+            const double avg_ms = std::accumulate(measured_ms.begin(), measured_ms.end(), 0.0) / measured_ms.size();
+            std::printf("measured_steps=%d average_duration_ms=%.3f\n", kMeasuredSteps, avg_ms);
         }
-
-        std::map<std::string, ggml_tensor*> param_tensors;
-        runner.get_param_tensors(param_tensors);
-
-        std::mt19937 weights_rng(kRandomSeed);
-        for (const auto& entry : param_tensors) {
-            fill_backend_tensor_random(entry.second, weights_rng, -kWeightInitScale, kWeightInitScale);
-        }
-
-        sd::Tensor<ggml_fp16_t> latent({latent_size, latent_size, kLatentChannels, kBatchSize});
-        sd::Tensor<ggml_fp16_t> context({kContextDim, kContextTokens, kBatchSize});
-        sd::Tensor<float> timesteps({kBatchSize});
-
-        std::mt19937 input_rng(kRandomSeed + 1U);
-        latent.values()  = make_random_values<ggml_fp16_t>(latent.numel(), input_rng, -kInputInitScale, kInputInitScale);
-        context.values() = make_random_values<ggml_fp16_t>(context.numel(), input_rng, -kInputInitScale, kInputInitScale);
-        timesteps.values().assign(static_cast<size_t>(kBatchSize), 999.0f);
-
-        std::printf("Stable Diffusion 1.5 UNet perf test\n");
-        std::printf("image_size=%dx%d latent_shape=[%d,%d,%d,%d] context_shape=[%d,%d,%d] threads=%d params=%zu params_buffer_mb=%.2f\n",
-                    kImageSize,
-                    kImageSize,
-                    latent_size,
-                    latent_size,
-                    kLatentChannels,
-                    kBatchSize,
-                    kContextDim,
-                    kContextTokens,
-                    kBatchSize,
-                    n_threads,
-                    param_tensors.size(),
-                    runner.get_params_buffer_size() / (1024.0 * 1024.0));
-
-        for (int step = 0; step < kWarmupSteps; ++step) {
-            const int64_t t0 = ggml_time_us();
-            const ggml_tensor* output = runner.run(n_threads, latent, timesteps, context);
-            const int64_t t1 = ggml_time_us();
-            std::printf("warmup_step_%d duration_ms=%.3f output_type=%s output_shape=[%lld,%lld,%lld,%lld] checksum=%.6f\n",
-                        step + 1,
-                        (t1 - t0) / 1000.0,
-                        ggml_type_name(output->type),
-                        output->ne[0],
-                        output->ne[1],
-                        output->ne[2],
-                        output->ne[3],
-                        checksum_tensor(output));
-        }
-
-        std::vector<double> measured_ms;
-        measured_ms.reserve(kMeasuredSteps);
-        for (int step = 0; step < kMeasuredSteps; ++step) {
-            const int64_t t0 = ggml_time_us();
-            const ggml_tensor* output = runner.run(n_threads, latent, timesteps, context);
-            const int64_t t1 = ggml_time_us();
-            const double elapsed_ms = (t1 - t0) / 1000.0;
-            measured_ms.push_back(elapsed_ms);
-
-            std::printf("measured_step_%d duration_ms=%.3f output_type=%s output_shape=[%lld,%lld,%lld,%lld] checksum=%.6f\n",
-                        step + 1,
-                        elapsed_ms,
-                        ggml_type_name(output->type),
-                        output->ne[0],
-                        output->ne[1],
-                        output->ne[2],
-                        output->ne[3],
-                        checksum_tensor(output));
-        }
-
-        const double avg_ms = std::accumulate(measured_ms.begin(), measured_ms.end(), 0.0) / measured_ms.size();
-        std::printf("measured_steps=%d average_duration_ms=%.3f\n", kMeasuredSteps, avg_ms);
     }
 
     ggml_backend_free(backend);
-    return EXIT_SUCCESS;
+    return return_code;
 }
