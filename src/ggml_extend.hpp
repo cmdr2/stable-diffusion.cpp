@@ -2277,6 +2277,10 @@ public:
         return "GGMLBlock";
     }
 
+    ParameterMap& get_params() {
+        return params;
+    }
+
     void get_all_blocks(std::vector<GGMLBlock*>& result) {
         result.push_back(this);
         for (auto& block_iter : blocks) {
