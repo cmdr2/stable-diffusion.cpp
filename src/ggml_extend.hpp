@@ -1420,7 +1420,15 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
     if (flash_attn) {
         // LOG_DEBUG("attention_ext L_q:%d L_k:%d n_head:%d C:%d d_head:%d N:%d", L_q, L_k, n_head, C, d_head, N);
         bool can_use_flash_attn = true;
-        if (can_use_flash_attn && L_k % 256 != 0) {
+        // Note: Previous code padded L_k to multiples of 256 (FATTN_KQ_STRIDE) to enable
+        // the GQA-optimized flash attention path. However, GQA optimization only applies when
+        // gqa_ratio >= 2 (i.e. n_head > n_kv_head), which is not the case for standard
+        // SD1.5/SDXL cross-attention or self-attention. For those cases, the padding wastes
+        // significant computation (e.g. 77→256 = 3.3x overhead for cross-attention).
+        // The flash attention kernel handles unpadded K/V correctly via its non-GQA path.
+        // Only pad when GQA optimization would actually benefit.
+        int64_t gqa_ratio = n_head / n_kv_head;
+        if (can_use_flash_attn && gqa_ratio >= 2 && L_k % 256 != 0) {
             kv_pad = GGML_PAD(L_k, 256) - static_cast<int>(L_k);
         }
 
