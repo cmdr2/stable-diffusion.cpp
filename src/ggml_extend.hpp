@@ -2147,6 +2147,8 @@ public:
             LOG_ERROR("%s alloc compute buffer failed", get_desc().c_str());
             return std::nullopt;
         }
+
+        int64_t t_graph_start = ggml_time_us();
         reset_compute_ctx();
         ggml_cgraph* gf = get_compute_graph(get_graph);
         if (!ggml_gallocr_alloc_graph(compute_allocr, gf)) {
@@ -2154,15 +2156,26 @@ public:
             return std::nullopt;
         }
         copy_data_to_backend_tensor();
+        int64_t t_graph_end = ggml_time_us();
+
         if (ggml_backend_is_cpu(runtime_backend)) {
             ggml_backend_cpu_set_n_threads(runtime_backend, n_threads);
         }
 
+        int64_t t_compute_start = ggml_time_us();
         ggml_status status = ggml_backend_graph_compute(runtime_backend, gf);
+        int64_t t_compute_end = ggml_time_us();
+
         if (status != GGML_STATUS_SUCCESS) {
             LOG_ERROR("%s compute failed: %s", get_desc().c_str(), ggml_status_to_string(status));
             return std::nullopt;
         }
+
+        fprintf(stderr, "[TIMING] %s graph_build=%.1fms compute=%.1fms\n",
+                  get_desc().c_str(),
+                  (t_graph_end - t_graph_start) / 1000.0,
+                  (t_compute_end - t_compute_start) / 1000.0);
+
         copy_cache_tensors_to_cache_buffer();
         auto result = ggml_get_tensor(compute_ctx, final_result_name.c_str());
         std::optional<sd::Tensor<T>> output;
