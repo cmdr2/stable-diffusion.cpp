@@ -1336,15 +1336,16 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
         d_head    = C / n_head;
         n_kv_head = k->ne[0] / d_head;
 
-        q = ggml_reshape_4d(ctx, q, d_head, n_head, L_q, N);       // [N, L_q, n_head, d_head]
-        q = ggml_ext_cont(ctx, ggml_permute(ctx, q, 0, 2, 1, 3));  // [N, n_head, L_q, d_head]
-        q = ggml_reshape_3d(ctx, q, d_head, L_q, n_head * N);      // [N * n_head, L_q, d_head]
+        // Reshape Q, K, V to 4D and permute to attention layout.
+        // For flash attention: keep as 4D non-contiguous (avoid expensive cont copies).
+        // For fallback: cont+reshape to 3D happens inside the fallback branch.
+        q = ggml_reshape_4d(ctx, q, d_head, n_head, L_q, N);    // ne: [d_head, n_head, L_q, N]
+        q = ggml_permute(ctx, q, 0, 2, 1, 3);                   // ne: [d_head, L_q, n_head, N] (non-contiguous)
 
-        k = ggml_reshape_4d(ctx, k, d_head, n_kv_head, L_k, N);    // [N, L_k, n_kv_head, d_head]
-        k = ggml_ext_cont(ctx, ggml_permute(ctx, k, 0, 2, 1, 3));  // [N, n_kv_head, L_k, d_head]
-        k = ggml_reshape_3d(ctx, k, d_head, L_k, n_kv_head * N);   // [N * n_kv_head, L_k, d_head]
+        k = ggml_reshape_4d(ctx, k, d_head, n_kv_head, L_k, N); // ne: [d_head, n_kv_head, L_k, N]
+        k = ggml_permute(ctx, k, 0, 2, 1, 3);                   // ne: [d_head, L_k, n_kv_head, N] (non-contiguous)
 
-        v = ggml_reshape_4d(ctx, v, d_head, n_kv_head, L_k, N);  // [N, L_k, n_kv_head, d_head]
+        v = ggml_reshape_4d(ctx, v, d_head, n_kv_head, L_k, N); // ne: [d_head, n_kv_head, L_k, N]
     } else {
         L_q       = q->ne[1];
         L_k       = k->ne[1];
@@ -1359,6 +1360,9 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
     int kv_pad       = 0;
     ggml_tensor* kqv = nullptr;
 
+    // Flash attention path: uses 4D non-contiguous Q, K, V directly.
+    // flash_attn_ext only requires row-contiguity (ne[0] stride == element size),
+    // which is preserved by permute since we never permute dimension 0.
     auto build_kqv = [&](ggml_tensor* q_in, ggml_tensor* k_in, ggml_tensor* v_in, ggml_tensor* mask_in) -> ggml_tensor* {
         if (kv_pad != 0) {
             k_in = ggml_pad(ctx, k_in, 0, kv_pad, 0, 0);
@@ -1368,8 +1372,8 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
         }
         k_in = ggml_cast(ctx, k_in, GGML_TYPE_F16);
 
-        v_in = ggml_ext_cont(ctx, ggml_permute(ctx, v_in, 0, 2, 1, 3));
-        v_in = ggml_reshape_3d(ctx, v_in, d_head, L_k, n_kv_head * N);
+        // V: permute to [d_head, L_k, n_kv_head, N] without cont - pad/cast handle non-contiguous
+        v_in = ggml_permute(ctx, v_in, 0, 2, 1, 3);
         if (kv_pad != 0) {
             v_in = ggml_pad(ctx, v_in, 0, kv_pad, 0, 0);
         }
@@ -1412,7 +1416,6 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
     };
 
     if (flash_attn) {
-        // LOG_DEBUG("attention_ext L_q:%d L_k:%d n_head:%d C:%d d_head:%d N:%d", L_q, L_k, n_head, C, d_head, N);
         bool can_use_flash_attn = true;
         if (can_use_flash_attn && L_k % 256 != 0) {
             kv_pad = GGML_PAD(L_k, 256) - static_cast<int>(L_k);
@@ -1428,16 +1431,26 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
             if (!ggml_backend_supports_op(backend, kqv)) {
                 kqv = nullptr;
             } else {
-                kqv = ggml_view_3d(ctx, kqv, d_head, n_head, L_q, kqv->nb[1], kqv->nb[2], 0);
+                // flash_attn_ext output: [d_head, L_q, n_head, N]
+                // Permute to get n_head adjacent to d_head for merging
+                kqv = ggml_permute(ctx, kqv, 0, 2, 1, 3);  // [d_head, n_head, L_q, N]
             }
         }
     }
 
     if (kqv == nullptr) {
-        // if (flash_attn) {
-        //     LOG_DEBUG("fallback to default attention, L_q:%d L_k:%d n_head:%d C:%d d_head:%d N:%d", L_q, L_k, n_head, C, d_head, N);
-        // }
-        v = ggml_ext_cont(ctx, ggml_permute(ctx, v, 1, 2, 0, 3));  // [N, n_kv_head, d_head, L_k]
+        // Fallback: standard attention needs 3D contiguous Q, K, V
+        if (!skip_reshape) {
+            // Q and K are 4D non-contiguous from the shared preparation above.
+            // Make them contiguous and reshape to 3D for mul_mat.
+            q = ggml_cont(ctx, q);                                      // [d_head, L_q, n_head, N] contiguous
+            q = ggml_reshape_3d(ctx, q, d_head, L_q, n_head * N);      // [N * n_head, L_q, d_head]
+
+            k = ggml_cont(ctx, k);                                      // [d_head, L_k, n_kv_head, N] contiguous
+            k = ggml_reshape_3d(ctx, k, d_head, L_k, n_kv_head * N);   // [N * n_kv_head, L_k, d_head]
+        }
+
+        v = ggml_ext_cont(ctx, ggml_permute(ctx, v, 1, 2, 0, 3));  // [L_k, d_head, n_kv_head, N] contiguous
         v = ggml_reshape_3d(ctx, v, L_k, d_head, n_kv_head * N);   // [N * n_kv_head, d_head, L_k]
 
         auto kq = ggml_mul_mat(ctx, k, q);  // [N * n_head, L_q, L_k]
