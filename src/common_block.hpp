@@ -172,7 +172,7 @@ public:
             x                    = skip_connection->forward(ctx, x);  // [N, out_channels, h, w] if dims == 2 else [N, out_channels, t, h, w]
         }
 
-        h = ggml_add(ctx->ggml_ctx, h, x);
+        h = ggml_add_inplace(ctx->ggml_ctx, h, x);
         return h;  // [N, out_channels, h, w] if dims == 2 else [N, out_channels, t, h, w]
     }
 };

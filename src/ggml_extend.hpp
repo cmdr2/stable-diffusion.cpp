@@ -1005,6 +1005,9 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_scale(ggml_context* ctx,
                                               ggml_tensor* x,
                                               float factor,
                                               bool inplace = false) {
+    if (factor == 1.0f) {
+        return x;  // no-op scale
+    }
     if (!ggml_is_contiguous(x)) {
         x = ggml_cont(ctx, x);
     }

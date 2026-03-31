@@ -476,7 +476,7 @@ public:
             label_emb      = ggml_silu_inplace(ctx->ggml_ctx, label_emb);
             label_emb      = label_embed_2->forward(ctx, label_emb);  // [N, time_embed_dim]
 
-            emb = ggml_add(ctx->ggml_ctx, emb, label_emb);  // [N, time_embed_dim]
+            emb = ggml_add_inplace(ctx->ggml_ctx, emb, label_emb);  // [N, time_embed_dim]
         }
 
         // input_blocks
@@ -529,7 +529,7 @@ public:
         }
         if (controls.size() > 0) {
             auto cs = ggml_ext_scale(ctx->ggml_ctx, controls[controls.size() - 1], control_strength, true);
-            h       = ggml_add(ctx->ggml_ctx, h, cs);  // middle control
+            h       = ggml_add_inplace(ctx->ggml_ctx, h, cs);  // middle control
         }
         int control_offset = static_cast<int>(controls.size() - 2);
 
