@@ -1655,15 +1655,19 @@ public:
             if (!cond.c_concat.empty() && !uncond.c_concat.empty()) {
                 cfg_batched_c_concat = sd::ops::concat(cond.c_concat, uncond.c_concat, 0);
             } else if (!cond.c_concat.empty()) {
+                // Duplicate cond's c_concat to maintain batch_size=2 when uncond has none
                 cfg_batched_c_concat = sd::ops::concat(cond.c_concat, cond.c_concat, 0);
             } else if (!uncond.c_concat.empty()) {
+                // Duplicate uncond's c_concat to maintain batch_size=2 when cond has none
                 cfg_batched_c_concat = sd::ops::concat(uncond.c_concat, uncond.c_concat, 0);
             }
             if (!cond.c_vector.empty() && !uncond.c_vector.empty()) {
                 cfg_batched_y = sd::ops::concat(cond.c_vector, uncond.c_vector, 0);
             } else if (!cond.c_vector.empty()) {
+                // Duplicate cond's y to maintain batch_size=2 when uncond has none
                 cfg_batched_y = sd::ops::concat(cond.c_vector, cond.c_vector, 0);
             } else if (!uncond.c_vector.empty()) {
+                // Duplicate uncond's y to maintain batch_size=2 when cond has none
                 cfg_batched_y = sd::ops::concat(uncond.c_vector, uncond.c_vector, 0);
             }
         }
@@ -1755,9 +1759,9 @@ public:
                 }
 
                 // Split output along batch dimension: first half = cond, second half = uncond
-                int64_t half_batch = batched_output.shape()[0] / 2;
-                cond_out           = sd::ops::slice(batched_output, 0, 0, half_batch);
-                uncond_out         = sd::ops::slice(batched_output, 0, half_batch, batched_output.shape()[0]);
+                GGML_ASSERT(batched_output.shape()[0] == 2);
+                cond_out   = sd::ops::slice(batched_output, 0, 0, 1);
+                uncond_out = sd::ops::slice(batched_output, 0, 1, 2);
             } else {
                 // ---- Original unbatched path ----
                 compute_sample_controls(control_image,
