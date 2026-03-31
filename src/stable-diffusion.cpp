@@ -760,7 +760,12 @@ public:
                 }
             }
 
-            if (sd_ctx_params->flash_attn || sd_ctx_params->diffusion_flash_attn) {
+            // Enable flash attention for the diffusion model when explicitly
+            // requested, or automatically when running on a GPU backend.
+            bool enable_diffusion_flash_attn = sd_ctx_params->flash_attn ||
+                                               sd_ctx_params->diffusion_flash_attn ||
+                                               !ggml_backend_is_cpu(backend);
+            if (enable_diffusion_flash_attn) {
                 LOG_INFO("Using flash attention in the diffusion model");
                 diffusion_model->set_flash_attention_enabled(true);
                 if (high_noise_diffusion_model) {
@@ -1624,6 +1629,23 @@ public:
         sd::Tensor<float> denoised   = x_t;
         SamplePreviewContext preview = prepare_sample_preview_context();
 
+        // Determine whether we can batch the conditional and unconditional passes
+        // into a single forward pass with batch_size=2, avoiding two separate UNet
+        // evaluations per step. This roughly doubles throughput on GPU backends.
+        bool can_batch_cfg = !uncond.empty() &&
+                             img_cond.empty() &&
+                             control_image.empty() &&
+                             !has_skiplayer &&
+                             start_merge_step == -1 &&
+                             id_cond.empty() &&
+                             vace_context.empty() &&
+                             ref_latents.empty() &&
+                             cache_runtime.mode == sd_sample::SampleCacheMode::NONE;
+
+        if (can_batch_cfg) {
+            LOG_INFO("Using batched CFG (cond + uncond in single forward pass)");
+        }
+
         auto denoise = [&](const sd::Tensor<float>& x, float sigma, int step) -> sd::Tensor<float> {
             if (step == 1 || step == -1) {
                 pretty_progress(0, (int)steps, 0);
@@ -1680,82 +1702,147 @@ public:
             diffusion_params.vace_strength      = vace_strength;
             diffusion_params.skip_layers        = nullptr;
 
-            compute_sample_controls(control_image,
-                                    noised_input,
-                                    timesteps_tensor,
-                                    cond,
-                                    &controls);
+            // ---- Batched CFG path ----
+            // Run cond and uncond in a single forward pass with batch_size=2.
+            bool is_skiplayer_step = false;
+            if (can_batch_cfg) {
+                // Concatenate inputs along batch dimension (dim 0)
+                sd::Tensor<float> batched_x  = sd::ops::concat(noised_input, noised_input, 0);
+                sd::Tensor<float> batched_ts = sd::ops::concat(timesteps_tensor, timesteps_tensor, 0);
 
-            auto run_condition = [&](const SDCondition& condition,
-                                     const sd::Tensor<float>* c_concat_override = nullptr,
-                                     const std::vector<int>* local_skip_layers  = nullptr) -> sd::Tensor<float> {
-                diffusion_params.context     = condition.c_crossattn.empty() ? nullptr : &condition.c_crossattn;
-                diffusion_params.c_concat    = c_concat_override != nullptr ? c_concat_override : (condition.c_concat.empty() ? nullptr : &condition.c_concat);
-                diffusion_params.y           = condition.c_vector.empty() ? nullptr : &condition.c_vector;
-                diffusion_params.t5_ids      = condition.c_t5_ids.empty() ? nullptr : &condition.c_t5_ids;
-                diffusion_params.t5_weights  = condition.c_t5_weights.empty() ? nullptr : &condition.c_t5_weights;
-                diffusion_params.skip_layers = local_skip_layers;
-
-                sd::Tensor<float> cached_output;
-                if (step_cache.before_condition(&condition, noised_input, &cached_output)) {
-                    return std::move(cached_output);
+                // Concatenate context embeddings (cond + uncond)
+                sd::Tensor<float> batched_context;
+                if (!cond.c_crossattn.empty() && !uncond.c_crossattn.empty()) {
+                    batched_context = sd::ops::concat(cond.c_crossattn, uncond.c_crossattn, 0);
                 }
 
-                auto output_opt = work_diffusion_model->compute(n_threads, diffusion_params);
-                if (output_opt.empty()) {
-                    LOG_ERROR("diffusion model compute failed");
-                    return sd::Tensor<float>();
+                // Concatenate c_concat if both conditions have it
+                sd::Tensor<float> batched_c_concat;
+                if (!cond.c_concat.empty() && !uncond.c_concat.empty()) {
+                    batched_c_concat = sd::ops::concat(cond.c_concat, uncond.c_concat, 0);
+                } else if (!cond.c_concat.empty()) {
+                    batched_c_concat = sd::ops::concat(cond.c_concat, cond.c_concat, 0);
+                } else if (!uncond.c_concat.empty()) {
+                    batched_c_concat = sd::ops::concat(uncond.c_concat, uncond.c_concat, 0);
                 }
 
-                step_cache.after_condition(&condition, noised_input, output_opt);
-                return output_opt;
-            };
+                // Concatenate y (class embeddings) if present
+                sd::Tensor<float> batched_y;
+                if (!cond.c_vector.empty() && !uncond.c_vector.empty()) {
+                    batched_y = sd::ops::concat(cond.c_vector, uncond.c_vector, 0);
+                } else if (!cond.c_vector.empty()) {
+                    batched_y = sd::ops::concat(cond.c_vector, cond.c_vector, 0);
+                } else if (!uncond.c_vector.empty()) {
+                    batched_y = sd::ops::concat(uncond.c_vector, uncond.c_vector, 0);
+                }
 
-            if (start_merge_step == -1 || step <= start_merge_step) {
-                cond_out = run_condition(cond);
-                if (cond_out.empty()) {
+                // Concatenate guidance tensor for distilled models
+                sd::Tensor<float> batched_guidance = sd::ops::concat(guidance_tensor, guidance_tensor, 0);
+
+                DiffusionParams batched_params;
+                batched_params.x                  = &batched_x;
+                batched_params.timesteps          = &batched_ts;
+                batched_params.context            = batched_context.empty() ? nullptr : &batched_context;
+                batched_params.c_concat           = batched_c_concat.empty() ? nullptr : &batched_c_concat;
+                batched_params.y                  = batched_y.empty() ? nullptr : &batched_y;
+                batched_params.guidance           = &batched_guidance;
+                batched_params.ref_latents        = &ref_latents;
+                batched_params.increase_ref_index = increase_ref_index;
+                batched_params.controls           = &controls;
+                batched_params.control_strength   = control_strength;
+                batched_params.vace_context       = nullptr;
+                batched_params.vace_strength      = vace_strength;
+                batched_params.skip_layers        = nullptr;
+
+                auto batched_output = work_diffusion_model->compute(n_threads, batched_params);
+                if (batched_output.empty()) {
+                    LOG_ERROR("batched diffusion model compute failed");
                     return {};
                 }
+
+                // Split output along batch dimension: first half = cond, second half = uncond
+                int64_t half_batch = batched_output.shape()[0] / 2;
+                cond_out           = sd::ops::slice(batched_output, 0, 0, half_batch);
+                uncond_out         = sd::ops::slice(batched_output, 0, half_batch, batched_output.shape()[0]);
             } else {
-                GGML_ASSERT(!id_cond.empty());
-                cond_out = run_condition(id_cond,
-                                         cond.c_concat.empty() ? nullptr : &cond.c_concat);
-                if (cond_out.empty()) {
-                    return {};
-                }
-            }
+                // ---- Original unbatched path ----
+                compute_sample_controls(control_image,
+                                        noised_input,
+                                        timesteps_tensor,
+                                        cond,
+                                        &controls);
 
-            if (!uncond.empty()) {
-                if (!step_cache.is_step_skipped()) {
-                    compute_sample_controls(control_image,
-                                            noised_input,
-                                            timesteps_tensor,
-                                            uncond,
-                                            &controls);
-                }
-                uncond_out = run_condition(uncond);
-                if (uncond_out.empty()) {
-                    return {};
-                }
-            }
-            if (!img_cond.empty()) {
-                img_cond_out = run_condition(img_cond,
-                                             cond.c_concat.empty() ? nullptr : &cond.c_concat);
-                if (img_cond_out.empty()) {
-                    return {};
-                }
-            }
-            bool is_skiplayer_step = has_skiplayer &&
-                                     step > (int)(guidance.slg.layer_start * static_cast<int>(sigmas.size())) &&
-                                     step < (int)(guidance.slg.layer_end * static_cast<int>(sigmas.size()));
-            if (is_skiplayer_step) {
-                LOG_DEBUG("Skipping layers at step %d\n", step);
-                if (!step_cache.is_step_skipped()) {
-                    skip_cond_out = run_condition(cond,
-                                                  cond.c_concat.empty() ? nullptr : &cond.c_concat,
-                                                  &skip_layers);
-                    if (skip_cond_out.empty()) {
+                auto run_condition = [&](const SDCondition& condition,
+                                         const sd::Tensor<float>* c_concat_override = nullptr,
+                                         const std::vector<int>* local_skip_layers  = nullptr) -> sd::Tensor<float> {
+                    diffusion_params.context     = condition.c_crossattn.empty() ? nullptr : &condition.c_crossattn;
+                    diffusion_params.c_concat    = c_concat_override != nullptr ? c_concat_override : (condition.c_concat.empty() ? nullptr : &condition.c_concat);
+                    diffusion_params.y           = condition.c_vector.empty() ? nullptr : &condition.c_vector;
+                    diffusion_params.t5_ids      = condition.c_t5_ids.empty() ? nullptr : &condition.c_t5_ids;
+                    diffusion_params.t5_weights  = condition.c_t5_weights.empty() ? nullptr : &condition.c_t5_weights;
+                    diffusion_params.skip_layers = local_skip_layers;
+
+                    sd::Tensor<float> cached_output;
+                    if (step_cache.before_condition(&condition, noised_input, &cached_output)) {
+                        return std::move(cached_output);
+                    }
+
+                    auto output_opt = work_diffusion_model->compute(n_threads, diffusion_params);
+                    if (output_opt.empty()) {
+                        LOG_ERROR("diffusion model compute failed");
+                        return sd::Tensor<float>();
+                    }
+
+                    step_cache.after_condition(&condition, noised_input, output_opt);
+                    return output_opt;
+                };
+
+                if (start_merge_step == -1 || step <= start_merge_step) {
+                    cond_out = run_condition(cond);
+                    if (cond_out.empty()) {
                         return {};
+                    }
+                } else {
+                    GGML_ASSERT(!id_cond.empty());
+                    cond_out = run_condition(id_cond,
+                                             cond.c_concat.empty() ? nullptr : &cond.c_concat);
+                    if (cond_out.empty()) {
+                        return {};
+                    }
+                }
+
+                if (!uncond.empty()) {
+                    if (!step_cache.is_step_skipped()) {
+                        compute_sample_controls(control_image,
+                                                noised_input,
+                                                timesteps_tensor,
+                                                uncond,
+                                                &controls);
+                    }
+                    uncond_out = run_condition(uncond);
+                    if (uncond_out.empty()) {
+                        return {};
+                    }
+                }
+                if (!img_cond.empty()) {
+                    img_cond_out = run_condition(img_cond,
+                                                 cond.c_concat.empty() ? nullptr : &cond.c_concat);
+                    if (img_cond_out.empty()) {
+                        return {};
+                    }
+                }
+                is_skiplayer_step = has_skiplayer &&
+                                         step > (int)(guidance.slg.layer_start * static_cast<int>(sigmas.size())) &&
+                                         step < (int)(guidance.slg.layer_end * static_cast<int>(sigmas.size()));
+                if (is_skiplayer_step) {
+                    LOG_DEBUG("Skipping layers at step %d\n", step);
+                    if (!step_cache.is_step_skipped()) {
+                        skip_cond_out = run_condition(cond,
+                                                      cond.c_concat.empty() ? nullptr : &cond.c_concat,
+                                                      &skip_layers);
+                        if (skip_cond_out.empty()) {
+                            return {};
+                        }
                     }
                 }
             }
