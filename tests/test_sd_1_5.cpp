@@ -143,7 +143,7 @@ std::string build_safetensors_header(const std::vector<TensorSpec>& specs) {
     return header.str();
 }
 
-int create_memfd_or_die(const char* name) {
+int create_memfd(const char* name) {
     const long fd = ::syscall(SYS_memfd_create, name, MFD_CLOEXEC);
     return static_cast<int>(fd);
 }
@@ -186,7 +186,7 @@ int main() {
         return fail("failed to collect SD 1.5 tensor specs");
     }
 
-    const int fd = create_memfd_or_die("sd-1-5-dummy-model");
+    const int fd = create_memfd("sd-1-5-dummy-model");
     if (fd < 0) {
         return fail("failed to create in-memory model file");
     }
