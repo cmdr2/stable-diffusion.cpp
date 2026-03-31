@@ -187,8 +187,8 @@ if (SD_BUILD_EXAMPLES)
 endif()
 
 if (SD_BUILD_TESTS)
-    add_executable(sd-test-unet-perf tests/perf/test_unet.cpp)
-    target_link_libraries(sd-test-unet-perf PRIVATE stable-diffusion ${CMAKE_THREAD_LIBS_INIT})
+    enable_testing()
+    add_subdirectory(tests)
 endif()
 
 set(SD_PUBLIC_HEADERS include/stable-diffusion.h)
