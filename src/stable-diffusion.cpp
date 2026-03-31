@@ -1642,8 +1642,30 @@ public:
                              ref_latents.empty() &&
                              cache_runtime.mode == sd_sample::SampleCacheMode::NONE;
 
+        // Pre-compute batched tensors that stay constant across denoising steps.
+        sd::Tensor<float> cfg_batched_context;
+        sd::Tensor<float> cfg_batched_c_concat;
+        sd::Tensor<float> cfg_batched_y;
         if (can_batch_cfg) {
             LOG_INFO("Using batched CFG (cond + uncond in single forward pass)");
+
+            if (!cond.c_crossattn.empty() && !uncond.c_crossattn.empty()) {
+                cfg_batched_context = sd::ops::concat(cond.c_crossattn, uncond.c_crossattn, 0);
+            }
+            if (!cond.c_concat.empty() && !uncond.c_concat.empty()) {
+                cfg_batched_c_concat = sd::ops::concat(cond.c_concat, uncond.c_concat, 0);
+            } else if (!cond.c_concat.empty()) {
+                cfg_batched_c_concat = sd::ops::concat(cond.c_concat, cond.c_concat, 0);
+            } else if (!uncond.c_concat.empty()) {
+                cfg_batched_c_concat = sd::ops::concat(uncond.c_concat, uncond.c_concat, 0);
+            }
+            if (!cond.c_vector.empty() && !uncond.c_vector.empty()) {
+                cfg_batched_y = sd::ops::concat(cond.c_vector, uncond.c_vector, 0);
+            } else if (!cond.c_vector.empty()) {
+                cfg_batched_y = sd::ops::concat(cond.c_vector, cond.c_vector, 0);
+            } else if (!uncond.c_vector.empty()) {
+                cfg_batched_y = sd::ops::concat(uncond.c_vector, uncond.c_vector, 0);
+            }
         }
 
         auto denoise = [&](const sd::Tensor<float>& x, float sigma, int step) -> sd::Tensor<float> {
@@ -1706,45 +1728,17 @@ public:
             // Run cond and uncond in a single forward pass with batch_size=2.
             bool is_skiplayer_step = false;
             if (can_batch_cfg) {
-                // Concatenate inputs along batch dimension (dim 0)
+                // Only noised_input and timesteps change per step; context/y/c_concat are pre-batched.
                 sd::Tensor<float> batched_x  = sd::ops::concat(noised_input, noised_input, 0);
                 sd::Tensor<float> batched_ts = sd::ops::concat(timesteps_tensor, timesteps_tensor, 0);
-
-                // Concatenate context embeddings (cond + uncond)
-                sd::Tensor<float> batched_context;
-                if (!cond.c_crossattn.empty() && !uncond.c_crossattn.empty()) {
-                    batched_context = sd::ops::concat(cond.c_crossattn, uncond.c_crossattn, 0);
-                }
-
-                // Concatenate c_concat if both conditions have it
-                sd::Tensor<float> batched_c_concat;
-                if (!cond.c_concat.empty() && !uncond.c_concat.empty()) {
-                    batched_c_concat = sd::ops::concat(cond.c_concat, uncond.c_concat, 0);
-                } else if (!cond.c_concat.empty()) {
-                    batched_c_concat = sd::ops::concat(cond.c_concat, cond.c_concat, 0);
-                } else if (!uncond.c_concat.empty()) {
-                    batched_c_concat = sd::ops::concat(uncond.c_concat, uncond.c_concat, 0);
-                }
-
-                // Concatenate y (class embeddings) if present
-                sd::Tensor<float> batched_y;
-                if (!cond.c_vector.empty() && !uncond.c_vector.empty()) {
-                    batched_y = sd::ops::concat(cond.c_vector, uncond.c_vector, 0);
-                } else if (!cond.c_vector.empty()) {
-                    batched_y = sd::ops::concat(cond.c_vector, cond.c_vector, 0);
-                } else if (!uncond.c_vector.empty()) {
-                    batched_y = sd::ops::concat(uncond.c_vector, uncond.c_vector, 0);
-                }
-
-                // Concatenate guidance tensor for distilled models
                 sd::Tensor<float> batched_guidance = sd::ops::concat(guidance_tensor, guidance_tensor, 0);
 
                 DiffusionParams batched_params;
                 batched_params.x                  = &batched_x;
                 batched_params.timesteps          = &batched_ts;
-                batched_params.context            = batched_context.empty() ? nullptr : &batched_context;
-                batched_params.c_concat           = batched_c_concat.empty() ? nullptr : &batched_c_concat;
-                batched_params.y                  = batched_y.empty() ? nullptr : &batched_y;
+                batched_params.context            = cfg_batched_context.empty() ? nullptr : &cfg_batched_context;
+                batched_params.c_concat           = cfg_batched_c_concat.empty() ? nullptr : &cfg_batched_c_concat;
+                batched_params.y                  = cfg_batched_y.empty() ? nullptr : &cfg_batched_y;
                 batched_params.guidance           = &batched_guidance;
                 batched_params.ref_latents        = &ref_latents;
                 batched_params.increase_ref_index = increase_ref_index;
