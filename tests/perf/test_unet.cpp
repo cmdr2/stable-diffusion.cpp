@@ -26,6 +26,7 @@ constexpr int kMeasuredSteps               = 2;
 constexpr float kWeightInitScale           = 0.02f;
 constexpr float kInputInitScale            = 1.0f;
 constexpr unsigned int kRandomSeed         = 1337U;
+constexpr unsigned int kInputRandomSeedOffset = 1U;
 
 bool ends_with(const std::string& value, const char* suffix) {
     const size_t suffix_len = std::char_traits<char>::length(suffix);
@@ -222,7 +223,7 @@ int main() {
             sd::Tensor<ggml_fp16_t> context({kContextDim, kContextTokens, kBatchSize});
             sd::Tensor<float> timesteps({kBatchSize});
 
-            std::mt19937 input_rng(kRandomSeed + 1U);
+            std::mt19937 input_rng(kRandomSeed + kInputRandomSeedOffset);
             latent.values()  = make_random_values<ggml_fp16_t>(latent.numel(), input_rng, -kInputInitScale, kInputInitScale);
             context.values() = make_random_values<ggml_fp16_t>(context.numel(), input_rng, -kInputInitScale, kInputInitScale);
             timesteps.values().assign(static_cast<size_t>(kBatchSize), 999.0f);
