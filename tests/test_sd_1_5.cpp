@@ -34,13 +34,22 @@ struct TensorSpec {
 
 struct TempFile {
     std::string path;
+    int error_code = 0;
 
-    explicit TempFile(const char* name_template) {
-        std::vector<char> path_buf(std::strlen(name_template) + 1);
-        std::memcpy(path_buf.data(), name_template, path_buf.size());
+    explicit TempFile(const char* file_name_template) {
+        const char* temp_dir      = std::getenv("TMPDIR");
+        std::string name_template = temp_dir ? temp_dir : "/tmp";
+        if (!name_template.empty() && name_template.back() != '/') {
+            name_template.push_back('/');
+        }
+        name_template += file_name_template;
+
+        std::vector<char> path_buf(name_template.size() + 1);
+        std::memcpy(path_buf.data(), name_template.c_str(), path_buf.size());
 
         const int fd = ::mkstemp(path_buf.data());
         if (fd < 0) {
+            error_code = errno;
             return;
         }
 
@@ -207,7 +216,7 @@ bool run_sd_1_5_smoke_test(const std::string& model_path) {
     sd_ctx_params_init(&ctx_params);
     ctx_params.model_path            = model_path.c_str();
     ctx_params.n_threads             = 1;
-    ctx_params.wtype                 = SD_TYPE_COUNT;
+    ctx_params.wtype                 = SD_TYPE_COUNT;  // keep the file-native weight types
     ctx_params.rng_type              = CPU_RNG;
     ctx_params.sampler_rng_type      = CPU_RNG;
     ctx_params.enable_mmap           = false;
@@ -252,6 +261,9 @@ bool run_sd_1_5_smoke_test(const std::string& model_path) {
 }  // namespace
 
 int main() {
+    constexpr const char* kNoVAEPath          = nullptr;
+    constexpr const char* kNoTensorTypeRules  = nullptr;
+
     const std::vector<TensorSpec> specs = collect_sd_1_5_tensor_specs();
     if (specs.empty()) {
         return fail("failed to collect SD 1.5 tensor specs");
@@ -276,13 +288,14 @@ int main() {
     };
 
     for (sd_type_t output_type : kOutputTypes) {
-        TempFile gguf_file("/tmp/test-sd-1-5-XXXXXX");
+        TempFile gguf_file("test-sd-1-5-XXXXXX");
         if (gguf_file.path.empty()) {
             ::close(fd);
-            return fail("failed to create temporary GGUF file");
+            std::fprintf(stderr, "failed to create temporary GGUF file: %s\n", std::strerror(gguf_file.error_code));
+            return 1;
         }
 
-        if (!convert(model_path.c_str(), nullptr, gguf_file.path.c_str(), output_type, nullptr, false)) {
+        if (!convert(model_path.c_str(), kNoVAEPath, gguf_file.path.c_str(), output_type, kNoTensorTypeRules, false)) {
             ::close(fd);
             std::fprintf(stderr, "failed to convert dummy model to %s\n", sd_type_name(output_type));
             return 1;
