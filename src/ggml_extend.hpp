@@ -713,22 +713,14 @@ __STATIC_INLINE__ std::vector<ggml_tensor*> ggml_ext_chunk(ggml_context* ctx,
 __STATIC_INLINE__ ggml_tensor* ggml_ext_silu_act(ggml_context* ctx, ggml_tensor* x, bool gate_first = true) {
     // x: [ne3, ne2, ne1, ne0]
     // return: [ne3, ne2, ne1, ne0/2]
-
-    auto x_vec = ggml_ext_chunk(ctx, x, 2, 0, false);
-    ggml_tensor* gate;
+    // Use fused SwiGLU: splits in half, applies SiLU to one half, multiplies.
     if (gate_first) {
-        gate = x_vec[0];
-        x    = x_vec[1];
+        // SiLU(first_half) * second_half
+        return ggml_swiglu(ctx, x);
     } else {
-        x    = x_vec[0];
-        gate = x_vec[1];
+        // SiLU(second_half) * first_half
+        return ggml_swiglu_swapped(ctx, x);
     }
-    gate = ggml_cont(ctx, gate);
-    gate = ggml_silu_inplace(ctx, gate);
-
-    x = ggml_mul(ctx, x, gate);  // [ne3, ne2, ne1, ne0/2]
-
-    return x;
 }
 
 typedef std::function<bool(ggml_tensor*, ggml_tensor*, bool)> on_tile_process;
