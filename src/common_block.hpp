@@ -456,6 +456,23 @@ public:
         }
     }
 
+    // Helper: apply a 1x1 Conv2d as a linear layer (avoiding im2col overhead).
+    // Assumes w is [1, 1, IC, OC] and x is [..., IC] (IC in ne[0]).
+    // Returns [..., OC] in F32.
+    ggml_tensor* apply_conv1x1_as_linear(GGMLRunnerContext* ctx,
+                                         ggml_tensor* x,
+                                         ggml_tensor* w,
+                                         ggml_tensor* b) {
+        int64_t IC = w->ne[2];
+        int64_t OC = w->ne[3];
+        auto w2d   = ggml_reshape_2d(ctx->ggml_ctx, w, IC, OC);
+        x          = ggml_mul_mat(ctx->ggml_ctx, w2d, x);
+        if (b != nullptr) {
+            x = ggml_add_inplace(ctx->ggml_ctx, x, b);
+        }
+        return x;
+    }
+
     virtual ggml_tensor* forward(GGMLRunnerContext* ctx,
                                  ggml_tensor* x,
                                  ggml_tensor* context) {
@@ -472,14 +489,23 @@ public:
         int64_t inner_dim = n_head * d_head;
 
         x = norm->forward(ctx, x);
+
+        // Both use_linear and !use_linear (1x1 Conv2d) paths share the same
+        // permute-first approach: permute to get channels in ne[0], then apply
+        // the linear/matmul. For 1x1 Conv2d, this avoids the expensive im2col
+        // + extra permute+cont that ggml_conv_2d would normally add.
+        // GGML layout: x is [w, h, in_channels, n]
+        x = ggml_cont(ctx->ggml_ctx, ggml_permute(ctx->ggml_ctx, x, 1, 2, 0, 3));  // [in_channels, w, h, n]
+        x = ggml_reshape_3d(ctx->ggml_ctx, x, inner_dim, w * h, n);                // [in_channels, w*h, n]
+
         if (use_linear) {
-            x = ggml_cont(ctx->ggml_ctx, ggml_permute(ctx->ggml_ctx, x, 1, 2, 0, 3));  // [N, h, w, inner_dim]
-            x = ggml_reshape_3d(ctx->ggml_ctx, x, inner_dim, w * h, n);                // [N, h * w, inner_dim]
-            x = proj_in->forward(ctx, x);                                              // [N, inner_dim, h, w]
+            x = proj_in->forward(ctx, x);
         } else {
-            x = proj_in->forward(ctx, x);                                              // [N, inner_dim, h, w]
-            x = ggml_cont(ctx->ggml_ctx, ggml_permute(ctx->ggml_ctx, x, 1, 2, 0, 3));  // [N, h, w, inner_dim]
-            x = ggml_reshape_3d(ctx->ggml_ctx, x, inner_dim, w * h, n);                // [N, h * w, inner_dim]
+            // Apply 1x1 Conv2d weight as linear: reshape [1,1,IC,OC] to [IC,OC]
+            auto& proj_in_params = blocks["proj_in"]->get_params();
+            ggml_tensor* w_in    = proj_in_params["weight"];
+            ggml_tensor* b_in    = proj_in_params.count("bias") ? proj_in_params["bias"] : nullptr;
+            x                    = apply_conv1x1_as_linear(ctx, x, w_in, b_in);
         }
 
         for (int i = 0; i < depth; i++) {
@@ -490,18 +516,16 @@ public:
         }
 
         if (use_linear) {
-            // proj_out
-            x = proj_out->forward(ctx, x);  // [N, in_channels, h, w]
-
-            x = ggml_cont(ctx->ggml_ctx, ggml_permute(ctx->ggml_ctx, x, 1, 0, 2, 3));  // [N, inner_dim, h * w]
-            x = ggml_reshape_4d(ctx->ggml_ctx, x, w, h, inner_dim, n);                 // [N, inner_dim, h, w]
+            x = proj_out->forward(ctx, x);
         } else {
-            x = ggml_cont(ctx->ggml_ctx, ggml_permute(ctx->ggml_ctx, x, 1, 0, 2, 3));  // [N, inner_dim, h * w]
-            x = ggml_reshape_4d(ctx->ggml_ctx, x, w, h, inner_dim, n);                 // [N, inner_dim, h, w]
-
-            // proj_out
-            x = proj_out->forward(ctx, x);  // [N, in_channels, h, w]
+            auto& proj_out_params = blocks["proj_out"]->get_params();
+            ggml_tensor* w_out    = proj_out_params["weight"];
+            ggml_tensor* b_out    = proj_out_params.count("bias") ? proj_out_params["bias"] : nullptr;
+            x                     = apply_conv1x1_as_linear(ctx, x, w_out, b_out);
         }
+
+        x = ggml_cont(ctx->ggml_ctx, ggml_permute(ctx->ggml_ctx, x, 1, 0, 2, 3));  // [w*h, inner_dim, n] -> [inner_dim, w*h, n]
+        x = ggml_reshape_4d(ctx->ggml_ctx, x, w, h, inner_dim, n);                 // [w, h, inner_dim, n]
 
         x = ggml_add(ctx->ggml_ctx, x, x_in);
         return x;

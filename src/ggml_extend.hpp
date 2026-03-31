@@ -2159,6 +2159,7 @@ public:
         }
 
         ggml_status status = ggml_backend_graph_compute(runtime_backend, gf);
+
         if (status != GGML_STATUS_SUCCESS) {
             LOG_ERROR("%s compute failed: %s", get_desc().c_str(), ggml_status_to_string(status));
             return std::nullopt;
@@ -2275,6 +2276,10 @@ public:
 
     virtual std::string get_desc() {
         return "GGMLBlock";
+    }
+
+    ParameterMap& get_params() {
+        return params;
     }
 
     void get_all_blocks(std::vector<GGMLBlock*>& result) {
