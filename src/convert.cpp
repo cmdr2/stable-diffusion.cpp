@@ -3,9 +3,9 @@
 #include <regex>
 #include <vector>
 
-#include "model.h"
 #include "model_io/gguf_io.h"
 #include "model_io/safetensors_io.h"
+#include "model_loader.h"
 #include "util.h"
 
 #include "ggml_extend_backend.h"
@@ -99,7 +99,7 @@ bool convert(const char* input_path,
         model_loader.convert_tensors_name();
     }
 
-    ggml_type type             = (ggml_type)output_type;
+    ggml_type type             = sd_type_to_ggml_type(output_type);
     bool output_is_safetensors = ends_with(output_path, ".safetensors");
     TensorTypeRules type_rules = parse_tensor_type_rules(tensor_type_rules);
 
